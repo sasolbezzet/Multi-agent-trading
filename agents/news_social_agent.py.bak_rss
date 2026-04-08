@@ -1,0 +1,163 @@
+import requests
+import xml.etree.ElementTree as ET
+import os
+from datetime import datetime
+from textblob import TextBlob
+
+class NewsSocialAgent:
+    def __init__(self):
+        self.name = "News & Social Analyst"
+        self.rss_sources = [
+            ("CoinTelegraph", "https://cointelegraph.com/rss"),
+            ("Bitcoin.com", "https://news.bitcoin.com/feed/"),
+            ("ZyCrypto", "https://zycrypto.com/feed/"),
+            ("CryptoPotato", "https://cryptopotato.com/feed/"),
+            ("NewsBTC", "https://www.newsbtc.com/feed/"),
+            ("Bitcoinist", "https://bitcoinist.com/feed/"),
+            ("CryptoNews", "https://cryptonews.com/feed/"),
+            ("Decrypt", "https://decrypt.co/feed"),
+        ]
+        self.alpha_key = os.getenv('ALPHA_VANTAGE_KEY')
+    
+    async def analyze(self):
+        """Analisis berita dari RSS feeds + Alpha Vantage"""
+        
+        rss_news = await self._get_rss_news()
+        alpha_news = await self._get_alpha_news()
+        combined = self._combine_signals(rss_news, alpha_news)
+        
+        return {
+            "agent": self.name,
+            "signal": combined["signal"],
+            "confidence": combined["confidence"],
+            "rss_news": rss_news,
+            "alpha_news": alpha_news,
+            "reason": combined["reason"],
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    async def _get_rss_news(self):
+        """RSS Feeds dari 8 sumber"""
+        all_headlines = []
+        
+        for name, url in self.rss_sources:
+            try:
+                resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                if resp.status_code == 200:
+                    try:
+                        root = ET.fromstring(resp.content)
+                        for item in root.findall('.//item')[:2]:
+                            title = item.find('title')
+                            if title is not None and title.text:
+                                all_headlines.append(title.text)
+                    except:
+                        continue
+            except:
+                continue
+        
+        if not all_headlines:
+            return {"signal": "HOLD", "confidence": 50, "score": 0, "articles": 0}
+        
+        sentiments = []
+        for headline in all_headlines:
+            blob = TextBlob(headline)
+            sentiments.append(blob.sentiment.polarity)
+        
+        avg_score = sum(sentiments) / len(sentiments) if sentiments else 0
+        
+        if avg_score > 0.1:
+            signal = "BUY"
+            confidence = 65
+        elif avg_score < -0.1:
+            signal = "SELL"
+            confidence = 65
+        else:
+            signal = "HOLD"
+            confidence = 50
+        
+        return {
+            "signal": signal,
+            "confidence": confidence,
+            "score": round(avg_score, 3),
+            "articles": len(all_headlines),
+            "source": "RSS Feeds"
+        }
+    
+    async def _get_alpha_news(self):
+        """Alpha Vantage - SAMA PERSIS DENGAN STANDALONE TEST YANG BERHASIL"""
+        if not self.alpha_key:
+            return {"signal": "HOLD", "confidence": 50, "score": 0, "articles": 0}
+        
+        try:
+            # ENDPOINT YANG SAMA PERSIS DENGAN TEST YANG BERHASIL
+            url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers=BTC&apikey={self.alpha_key}&limit=50"
+            resp = requests.get(url, timeout=15)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                
+                # SAMA PERSIS DENGAN STANDALONE TEST
+                if 'feed' in data:
+                    articles = data['feed']
+                    
+                    if len(articles) > 0:
+                        sentiments = []
+                        for article in articles[:50]:
+                            score = article.get('overall_sentiment_score', 0)
+                            sentiments.append(score)
+                        
+                        avg_score = sum(sentiments) / len(sentiments) if sentiments else 0
+                        
+                        if avg_score >= 0.35:
+                            signal = "BUY"
+                            confidence = 80
+                        elif avg_score >= 0.15:
+                            signal = "BUY"
+                            confidence = 70
+                        elif avg_score <= -0.35:
+                            signal = "SELL"
+                            confidence = 80
+                        elif avg_score <= -0.15:
+                            signal = "SELL"
+                            confidence = 70
+                        else:
+                            signal = "HOLD"
+                            confidence = 50
+                        
+                        return {
+                            "signal": signal,
+                            "confidence": confidence,
+                            "score": round(avg_score, 3),
+                            "articles": len(articles),
+                            "source": "Alpha Vantage"
+                        }
+            
+            return {"signal": "HOLD", "confidence": 50, "score": 0, "articles": 0}
+            
+        except Exception as e:
+            print(f"Alpha Vantage error: {e}")
+            return {"signal": "HOLD", "confidence": 50, "score": 0, "articles": 0}
+    
+    def _combine_signals(self, rss, alpha):
+        """Gabungkan sinyal"""
+        signals = {"BUY": 0, "SELL": 0}
+        
+        rss_signal = rss.get('signal', 'HOLD')
+        if rss_signal in signals:
+            signals[rss_signal] += 1
+        
+        if alpha.get('articles', 0) > 0:
+            alpha_signal = alpha.get('signal', 'HOLD')
+            if alpha_signal in signals:
+                signals[alpha_signal] += 1
+        
+        if signals.get('BUY', 0) >= 2:
+            return {"signal": "BUY", "confidence": 70, "reason": f"Bullish: RSS={rss.get('score', 0):+.2f}, Alpha={alpha.get('score', 0):+.2f}"}
+        elif signals.get('SELL', 0) >= 2:
+            return {"signal": "SELL", "confidence": 70, "reason": f"Bearish: RSS={rss.get('score', 0):+.2f}, Alpha={alpha.get('score', 0):+.2f}"}
+        elif signals.get('BUY', 0) >= 1:
+            return {"signal": "BUY", "confidence": 60, "reason": f"Lean bullish: RSS={rss.get('score', 0):+.2f}"}
+        elif signals.get('SELL', 0) >= 1:
+            return {"signal": "SELL", "confidence": 60, "reason": f"Lean bearish: RSS={rss.get('score', 0):+.2f}"}
+        else:
+            return {"signal": "HOLD", "confidence": 50, "reason": f"Neutral: RSS={rss.get('score', 0):+.2f}"}

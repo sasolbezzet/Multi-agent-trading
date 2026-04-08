@@ -1,0 +1,387 @@
+import os
+import asyncio
+import logging
+from datetime import datetime
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
+# Import agents
+from agents.technical_agent import TechnicalAgent
+from agents.sentiment_agent import SentimentAgent
+from agents.news_social_agent import NewsSocialAgent
+from agents.exchange_agent import ExchangeAgent
+from agents.whale_agent import WhaleAgent
+from agents.whale_agent import WhaleAgent
+from agents.risk_agent import RiskAgent
+from agents.groq_orchestrator import GroqOrchestrator
+from utils.kucoin_api import KuCoinFutures
+
+async def _monitor_sltp_safe():
+    """Background monitoring SL/TP setiap 10 detik"""
+    logger.info("🟢 SL/TP Monitor started - checking every 10 seconds")
+    while True:
+        try:
+            pos = kucoin.get_position()
+            if pos['has_position']:
+                entry = pos['entry']
+                current = pos['current']
+                side = pos['side']
+                if side == 'long':
+                    if current <= entry * 0.985:
+                        logger.info(f"🔴 STOP LOSS HIT! Closing LONG at ${current:.2f}")
+                        kucoin.close_position()
+                    elif current >= entry * 1.03:
+                        logger.info(f"🎯 TAKE PROFIT HIT! Closing LONG at ${current:.2f}")
+                        kucoin.close_position()
+                else:
+                    if current >= entry * 1.015:
+                        logger.info(f"🔴 STOP LOSS HIT! Closing SHORT at ${current:.2f}")
+                        kucoin.close_position()
+                    elif current <= entry * 0.97:
+                        logger.info(f"🎯 TAKE PROFIT HIT! Closing SHORT at ${current:.2f}")
+                        kucoin.close_position()
+            await asyncio.sleep(10)
+        except Exception as e:
+            logger.error(f"Monitor error: {e}")
+            await asyncio.sleep(10)
+
+
+async def _monitor_sltp():
+    """Background monitoring SL/TP setiap 10 detik"""
+    while True:
+        try:
+            pos = kucoin.get_position()
+            if pos['has_position']:
+                entry = pos['entry']
+                current = pos['current']
+                side = pos['side']
+                if side == 'long':
+                    if current <= entry * 0.985:
+                        logger.info(f"SL HIT! Closing LONG at ${current:.2f}")
+                        kucoin.close_position()
+                    elif current >= entry * 1.03:
+                        logger.info(f"TP HIT! Closing LONG at ${current:.2f}")
+                        kucoin.close_position()
+                else:
+                    if current >= entry * 1.015:
+                        logger.info(f"SL HIT! Closing SHORT at ${current:.2f}")
+                        kucoin.close_position()
+                    elif current <= entry * 0.97:
+                        logger.info(f"TP HIT! Closing SHORT at ${current:.2f}")
+                        kucoin.close_position()
+            await asyncio.sleep(10)
+        except:
+            await asyncio.sleep(10)
+
+
+async def monitor_sltp_loop():
+    """Loop monitoring posisi setiap 10 detik"""
+    logger.info("🟢 SL/TP Monitor started")
+    while True:
+        try:
+            pos = kucoin.get_position()
+            if pos['has_position']:
+                entry = pos['entry']
+                current = pos['current']
+                side = pos['side']
+                if side == 'long':
+                    if current <= entry * 0.985:
+                        kucoin.close_position()
+                        logger.info(f"🔴 STOP LOSS HIT at ${current:.2f}")
+                    elif current >= entry * 1.03:
+                        kucoin.close_position()
+                        logger.info(f"🎯 TAKE PROFIT HIT at ${current:.2f}")
+                else:
+                    if current >= entry * 1.015:
+                        kucoin.close_position()
+                        logger.info(f"🔴 STOP LOSS HIT at ${current:.2f}")
+                    elif current <= entry * 0.97:
+                        kucoin.close_position()
+                        logger.info(f"🎯 TAKE PROFIT HIT at ${current:.2f}")
+            await asyncio.sleep(10)
+        except Exception as e:
+            logger.error(f"Monitor error: {e}")
+            await asyncio.sleep(10)
+
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+
+# Initialize agents
+technical = TechnicalAgent()
+sentiment = SentimentAgent()
+news_social = NewsSocialAgent()
+exchange = ExchangeAgent()
+whale = WhaleAgent()
+risk = RiskAgent()
+groq = GroqOrchestrator(os.getenv('GROQ_API_KEY'))
+kucoin = KuCoinFutures(
+    api_key=os.getenv('KUCOIN_API_KEY'),
+    api_secret=os.getenv('KUCOIN_API_SECRET'),
+    api_passphrase=os.getenv('KUCOIN_API_PASSPHRASE')
+)
+
+async def get_analysis():
+    price = kucoin.get_price()
+    balance = kucoin.get_balance()
+    position = kucoin.get_position()
+    has_position = position['has_position']
+    
+    tech = await technical.analyze()
+    sent = await sentiment.analyze()
+    news = await news_social.analyze()
+    exch = await exchange.analyze()
+    whale_data = await whale.analyze()
+    risk_res = await risk.analyze(balance, has_position, position if has_position else None)
+    
+    dec = await groq.decide(
+        technical=tech, sentiment=sent, news_social=news,
+        exchange=exch, whale=whale_data, risk=risk_res, current_price=price,
+        has_position=has_position, last_action=None
+    )
+    
+    # AUTO TRADE EXECUTION
+    action = dec.get('action', 'HOLD')
+    if action in ['BUY', 'SELL'] and not has_position and risk_res.get('can_trade'):
+        try:
+            if action == "BUY":
+                side = "buy"
+                sl = price * 0.985
+                tp = price * 1.03
+            else:
+                side = "sell"
+                sl = price * 1.015
+                tp = price * 0.97
+            
+            size = 1
+            order = kucoin.place_order(side, size, "XBTUSDTM")
+            if order:
+                logger.info(f"✅ AUTO TRADE: {action} at ${price:.2f}")
+                print(f"✅ AUTO TRADE: {action} at ${price:.2f}")
+        except Exception as e:
+            logger.error(f"Auto trade error: {e}")
+    
+    return tech, sent, news, exch, whale_data, risk_res, dec, price, balance, has_position, position
+
+def get_emoji(signal):
+    if signal == 'BUY':
+        return '🟢'
+    elif signal == 'SELL':
+        return '🔴'
+    else:
+        return '⚪'
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("📊 MARKET STATUS", callback_data="status")],
+        [InlineKeyboardButton("🔍 FORCE SIGNAL", callback_data="force")],
+        [InlineKeyboardButton("💰 BALANCE", callback_data="balance")],
+        [InlineKeyboardButton("📈 POSITION", callback_data="position")],
+        [InlineKeyboardButton("🔴 CLOSE POSITION", callback_data="close")],
+        [InlineKeyboardButton("🔄 REFRESH", callback_data="refresh")],
+        [InlineKeyboardButton("❓ HELP", callback_data="help")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    welcome_msg = (
+        "🤖 *GROQ MULTI-AGENT TRADING BOT*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🎯 *5 AI Agents Working Together:*\n"
+        "┌─────────────────────────────────┐\n"
+        "│ 📊 Technical Analyst (RSI/MACD) │\n"
+        "│ 📰 Sentiment Analyst (F&G)      │\n"
+        "│ 📱 News & Social Analyst       │\n"
+        "│ 💱 Exchange Flow Analyst       │\n"
+        "│ 🛡️ Risk Manager (SL/TP)        │\n"
+        "└─────────────────────────────────┘\n\n"
+        "🧠 *Groq LLM Orchestrator* (Llama 3.1)\n"
+        "   → Menggabungkan semua analisis\n\n"
+        "⚡ *Auto-Trading Active*\n"
+        "   → Analisis setiap 2 jam\n"
+        "   → Eksekusi otomatis ke KuCoin\n\n"
+        "📌 *Tekan tombol di bawah untuk mulai*"
+    )
+    await update.message.reply_text(welcome_msg, reply_markup=reply_markup, parse_mode='Markdown')
+
+async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = update.effective_chat.id
+    
+    if data == "status":
+        await context.bot.send_message(chat_id, "🔄 *Fetching market data...*", parse_mode='Markdown')
+        tech, sent, news, exch, whale_data, risk_res, dec, price, balance, has_pos, pos = await get_analysis()
+        
+        msg = (
+            "📊 *MARKET STATUS*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💰 *Balance:* ${balance:.2f} USDT\n"
+            f"📈 *BTC Price:* ${price:,.2f}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🤖 *AGENT SIGNALS*\n"
+            f"┌─────────────────────────────────┐\n"
+            f"│ 📊 Technical : {get_emoji(tech['signal'])} {tech['signal']} ({tech['confidence']}%)\n"
+            f"│ 📰 Sentiment : {get_emoji(sent['signal'])} {sent['signal']} ({sent['confidence']}%)\n"
+            f"│ 📱 News      : {get_emoji(news['signal'])} {news['signal']} ({news['confidence']}%)\n"
+            f"│ 💱 Exchange  : {get_emoji(exch['signal'])} {exch['signal']} ({exch['confidence']}%)\n"
+            f"└─────────────────────────────────┘\n\n"
+            f"🛡️ *Risk Manager:* {'✅ CAN TRADE' if risk_res.get('can_trade') else '❌ CANNOT TRADE'}\n"
+            f"📉 *Risk Score:* {risk_res.get('risk_score', 0)}/100\n"
+        )
+        
+        if has_pos:
+            msg += (
+                "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "📌 *ACTIVE POSITION*\n"
+                f"   Side: {'🟢 LONG' if pos['side'] == 'long' else '🔴 SHORT'}\n"
+                f"   Entry: ${pos['entry']:.2f}\n"
+                f"   Current: ${pos['current']:.2f}\n"
+                f"   P&L: {pos['pnl']:+.2f} USDT\n"
+            )
+        
+        msg += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += f"🕐 Last update: {datetime.now().strftime('%H:%M:%S')}"
+        await context.bot.send_message(chat_id, msg, parse_mode='Markdown')
+        
+    elif data == "force":
+        await context.bot.send_message(chat_id, "🔍 *Analyzing with 5 Agents...*", parse_mode='Markdown')
+        tech, sent, news, exch, whale_data, risk_res, dec, price, balance, has_pos, pos = await get_analysis()
+        
+        msg = (
+            "🎯 *FINAL TRADING SIGNAL*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📊 *Individual Agent Analysis:*\n"
+            "┌─────────────────────────────────────────┐\n"
+            f"│ 📊 Technical  : {tech['signal']} ({tech['confidence']}%)\n"
+            f"│    └─ RSI: {tech.get('rsi', 'N/A')} | Trend: {tech.get('trend', 'N/A')}\n"
+            f"│ 📰 Sentiment : {sent['signal']} ({sent['confidence']}%)\n"
+            f"│    └─ Fear & Greed: {sent.get('fear_greed', 'N/A')}\n"
+            f"│ 📱 News      : {news['signal']} ({news['confidence']}%)\n"
+            f"│ 💱 Exchange  : {exch['signal']} ({exch['confidence']}%)\n"
+            f"│    └─ {exch.get('reason', '')}\n"
+            f"└─────────────────────────────────────────┘\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🧠 *GROQ AI FINAL DECISION*\n"
+            f"   ➜ *{dec.get('action', 'HOLD')}* ({dec.get('confidence', 50)}% confidence)\n"
+            f"   📝 Reason: {dec.get('reason', 'N/A')}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Current Price: ${price:,.2f}\n"
+        )
+        
+        if has_pos:
+            msg += (
+                f"\n⚠️ *EXISTING POSITION*\n"
+                f"   Side: {pos['side'].upper()}\n"
+                f"   Entry: ${pos['entry']:.2f}\n"
+                f"   P&L: {pos['pnl']:+.2f} USDT\n"
+            )
+        
+        msg += f"\n🛡️ *Risk Status:* {'✅ CAN TRADE' if risk_res.get('can_trade') else '❌ CANNOT TRADE'}"
+        await context.bot.send_message(chat_id, msg, parse_mode='Markdown')
+        
+    elif data == "balance":
+        balance = kucoin.get_balance()
+        msg = (
+            "💰 *BALANCE INFORMATION*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💵 *Available Balance:*\n"
+            f"   ➜ ${balance:.2f} USDT\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📊 *Trading Limits:*\n"
+            f"   • Min margin: $2.66 (1 contract)\n"
+            f"   • Recommended: $10-20\n"
+            f"   • Max leverage: 25x"
+        )
+        await context.bot.send_message(chat_id, msg, parse_mode='Markdown')
+        
+    elif data == "position":
+        pos = kucoin.get_position()
+        if pos['has_position']:
+            msg = (
+                "📈 *ACTIVE POSITION DETAILS*\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📌 *Side:* {'🟢 LONG' if pos['side'] == 'long' else '🔴 SHORT'}\n"
+                f"💰 *Entry Price:* ${pos['entry']:.2f}\n"
+                f"📊 *Current Price:* ${pos['current']:.2f}\n"
+                f"📉 *P&L:* {pos['pnl']:+.2f} USDT\n"
+                f"📦 *Size:* {pos['size']} contract(s)\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "🎯 *Risk Management:*\n"
+                f"   🛡️ Stop Loss: -1.5%\n"
+                f"   🎯 Take Profit: +3%"
+            )
+        else:
+            msg = "📌 *No active position*\n\nUse FORCE SIGNAL to get trading signals."
+        await context.bot.send_message(chat_id, msg, parse_mode='Markdown')
+        
+    elif data == "close":
+        pos = kucoin.get_position()
+        if pos['has_position']:
+            await context.bot.send_message(chat_id, "🔄 *Closing position...*", parse_mode='Markdown')
+            result = kucoin.close_position()
+            if result:
+                msg = (
+                    "✅ *POSITION CLOSED*\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"📌 Side: {pos['side'].upper()}\n"
+                    f"💰 Exit Price: ${pos['current']:.2f}\n"
+                    f"📊 Final P&L: {pos['pnl']:+.2f} USDT"
+                )
+            else:
+                msg = "❌ *Failed to close position*\nPlease check KuCoin connection."
+        else:
+            msg = "⚠️ *No active position to close*"
+        await context.bot.send_message(chat_id, msg, parse_mode='Markdown')
+        
+    elif data == "refresh":
+        await context.bot.send_message(chat_id, "🔄 *Refreshing data...*", parse_mode='Markdown')
+        tech, sent, news, exch, whale_data, risk_res, dec, price, balance, has_pos, pos = await get_analysis()
+        msg = (
+            "✅ *DATA REFRESHED*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💰 Balance: ${balance:.2f}\n"
+            f"📈 BTC Price: ${price:,.2f}\n"
+            f"🤖 Last Signal: {dec.get('action', 'HOLD')} ({dec.get('confidence', 50)}%)\n"
+            f"🛡️ Risk: {'CAN TRADE' if risk_res.get('can_trade') else 'CANNOT TRADE'}"
+        )
+        await context.bot.send_message(chat_id, msg, parse_mode='Markdown')
+        
+    elif data == "help":
+        msg = (
+            "❓ *BOT COMMANDS & FEATURES*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📊 *MARKET STATUS* - Lihat semua sinyal agent\n"
+            "🔍 *FORCE SIGNAL* - Analisis real-time (5 agents + Groq)\n"
+            "💰 *BALANCE* - Cek saldo KuCoin\n"
+            "📈 *POSITION* - Detail posisi aktif\n"
+            "🔴 *CLOSE POSITION* - Tutup posisi manual\n"
+            "🔄 *REFRESH* - Update data terbaru\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚡ *AUTO-TRADING*\n"
+            "   • Analisis otomatis setiap 2 jam\n"
+            "   • Eksekusi sinyal ke KuCoin\n"
+            "   • SL: 1.5% | TP: 3%\n\n"
+            "📡 *Powered by:*\n"
+            "   • Groq AI (Llama 3.1)\n"
+            "   • 5 Specialized Agents\n"
+            "   • KuCoin Futures API"
+        )
+        await context.bot.send_message(chat_id, msg, parse_mode='Markdown')
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(callback))
+    logger.info("Bot started with 5 agents!")
+        # Start background monitor
+    loop = asyncio.get_event_loop()
+    loop.create_task(_monitor_sltp_safe())
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()

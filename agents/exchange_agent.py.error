@@ -1,0 +1,298 @@
+import requests
+from datetime import datetime
+
+class ExchangeAgent:
+    def __init__(self):
+        self.name = "Exchange Analyst"
+    
+    async def analyze(self):
+        """Analisis data dari exchange (harga spot + funding rate semua exchange)"""
+        
+        # Harga spot
+        coinbase = await self._get_coinbase()
+        kraken = await self._get_kraken()
+        binance_spot = await self._get_binance_spot()
+        
+        # Funding rate dari semua exchange
+        funding_rates = await self._get_all_funding_rates()
+        
+        result = self._analyze_flow(coinbase, kraken, binance_spot, funding_rates)
+        
+        return {
+            "agent": self.name,
+            "signal": result["signal"],
+            "confidence": result["confidence"],
+            "coinbase": coinbase,
+            "kraken": kraken,
+            "binance_spot": binance_spot,
+            "funding_rates": funding_rates,
+            "reason": result["reason"],
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    async def _get_coinbase(self):
+        try:
+            resp = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=5)
+            if resp.status_code == 200:
+                price = float(resp.json()['data']['amount'])
+                return {"price": price, "status": "OK"}
+        except:
+            pass
+        return {"price": 0, "status": "ERROR"}
+    
+    async def _get_kraken(self):
+        try:
+            resp = requests.get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()['result']['XXBTZUSD']
+                return {"bid": float(data['b'][0]), "ask": float(data['a'][0]), "last": float(data['c'][0]), "status": "OK"}
+        except:
+            pass
+        return {"last": 0, "status": "ERROR"}
+    
+    async def _get_binance_spot(self):
+        try:
+            resp = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                return {"price": float(data['price']), "status": "OK"}
+        except:
+            pass
+        return {"status": "ERROR"}
+    
+    async def _get_all_funding_rates(self):
+        """Ambil funding rate dari semua exchange futures (gratis)"""
+        results = {}
+        
+        # 1. Binance Futures
+        try:
+            url = "https://dapi.binance.com/dapi/v1/fundingRate?symbol=BTCUSD_PERP&limit=1"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data:
+                    rate = float(data[0].get('fundingRate', 0))
+                    results['binance'] = {
+                        "rate": rate,
+                        "signal": "SELL" if rate > 0.01 else "BUY" if rate < -0.005 else "HOLD"
+                    }
+            else:
+                results['binance'] = {"rate": 0, "signal": "HOLD", "error": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            results['binance'] = {"rate": 0, "signal": "HOLD", "error": str(e)}
+        
+        # 2. Bybit Futures
+        try:
+            url = "https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('retCode') == 0:
+                    rate = float(data['result']['list'][0].get('fundingRate', 0))
+                    results['bybit'] = {
+                        "rate": rate,
+                        "signal": "SELL" if rate > 0.01 else "BUY" if rate < -0.005 else "HOLD"
+                    }
+            else:
+                results['bybit'] = {"rate": 0, "signal": "HOLD", "error": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            results['bybit'] = {"rate": 0, "signal": "HOLD", "error": str(e)}
+        
+        # 3. OKX Futures
+        try:
+            url = "https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USD-SWAP"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('code') == '0' and data.get('data'):
+                    rate = float(data['data'][0].get('fundingRate', 0))
+                    results['okx'] = {
+                        "rate": rate,
+                        "signal": "SELL" if rate > 0.01 else "BUY" if rate < -0.005 else "HOLD"
+                    }
+            else:
+                results['okx'] = {"rate": 0, "signal": "HOLD", "error": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            results['okx'] = {"rate": 0, "signal": "HOLD", "error": str(e)}
+        
+        # 4. KuCoin Futures (REST API - gratis)
+        try:
+            url = "https://api-futures.kucoin.com/api/v1/funding-rate?symbol=XBTUSDTM"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('code') == '200000':
+                    rate_data = data.get('data', {})
+                    rate = float(rate_data.get('fundingRate', 0))
+                    results['kucoin'] = {
+                        "rate": rate,
+                        "signal": "SELL" if rate > 0.01 else "BUY" if rate < -0.005 else "HOLD"
+                    }
+                else:
+                    results['kucoin'] = {"rate": 0, "signal": "HOLD", "info": "API response code not 200000"}
+            else:
+                results['kucoin'] = {"rate": 0, "signal": "HOLD", "info": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            results['kucoin'] = {"rate": 0, "signal": "HOLD", "error": str(e)[:50]}
+        
+        # 5. Kraken Futures
+        try:
+            url = "https://futures.kraken.com/derivatives/api/v3/tickers"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                for ticker in data.get('tickers', []):
+                    if ticker.get('symbol') == 'PI_XBTUSD':
+                        rate = float(ticker.get('fundingRate', 0))
+                        results['kraken'] = {
+                            "rate": rate,
+                            "signal": "SELL" if rate > 0.01 else "BUY" if rate < -0.005 else "HOLD"
+                        }
+                        break
+            else:
+                results['kraken'] = {"rate": 0, "signal": "HOLD", "error": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            results['kraken'] = {"rate": 0, "signal": "HOLD", "error": str(e)}
+        
+        # 6. BitMEX
+        try:
+            url = "https://www.bitmex.com/api/v1/instrument?symbol=XBTUSD"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data:
+                    rate = float(data[0].get('fundingRate', 0))
+                    results['bitmex'] = {
+                        "rate": rate,
+                        "signal": "SELL" if rate > 0.01 else "BUY" if rate < -0.005 else "HOLD"
+                    }
+            else:
+                results['bitmex'] = {"rate": 0, "signal": "HOLD", "error": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            results['bitmex'] = {"rate": 0, "signal": "HOLD", "error": str(e)}
+        
+        # 7. Phemex Futures
+        try:
+            url = "https://api.phemex.com/md/funding_rates?symbol=BTCUSD"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('code') == 0 and data.get('data', {}).get('rows'):
+                    rate = float(data['data']['rows'][0].get('fundingRate', 0))
+                    results['phemex'] = {
+                        "rate": rate,
+                        "signal": "SELL" if rate > 0.01 else "BUY" if rate < -0.005 else "HOLD"
+                    }
+            else:
+                results['phemex'] = {"rate": 0, "signal": "HOLD", "info": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            results['phemex'] = {"rate": 0, "signal": "HOLD", "error": str(e)[:40]}
+        
+        # 8. Gate.io Futures
+        try:
+            url = "https://api.gateio.ws/api/v4/futures/usdt/contracts/BTC_USDT"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                rate = float(data.get('funding_rate', 0))
+                results['gateio'] = {
+                    "rate": rate,
+                    "signal": "SELL" if rate > 0.01 else "BUY" if rate < -0.005 else "HOLD"
+                }
+            else:
+                results['gateio'] = {"rate": 0, "signal": "HOLD", "error": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            results['gateio'] = {"rate": 0, "signal": "HOLD", "error": str(e)}
+        
+        # 9. HTX (formerly Huobi) - skip karena API berubah
+        results['htx'] = {"rate": 0, "signal": "HOLD", "info": "HTX API changed, temporarily disabled"}
+        
+        
+        # 10. MEXC Futures (gratis, no auth)
+        try:
+            url = "https://api.mexc.com/api/v3/funding-rate?symbol=BTCUSDT"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                rate = float(data.get('fundingRate', 0))
+                results['mexc'] = {
+                    "rate": rate,
+                    "signal": "SELL" if rate > 0.01 else "BUY" if rate < -0.005 else "HOLD"
+                }
+            else:
+                results['mexc'] = {"rate": 0, "signal": "HOLD", "info": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            results['mexc'] = {"rate": 0, "signal": "HOLD", "error": str(e)[:40]}
+    return results
+    
+    def _analyze_flow(self, coinbase, kraken, binance_spot, funding_rates):
+        """Analisis flow antar exchange + funding rate"""
+        prices = []
+        if coinbase.get('price', 0) > 0:
+            prices.append(coinbase['price'])
+        if kraken.get('last', 0) > 0:
+            prices.append(kraken['last'])
+        if binance_spot.get('price', 0) > 0:
+            prices.append(binance_spot['price'])
+        
+        if len(prices) < 2:
+            return {"signal": "HOLD", "confidence": 50, "reason": "Insufficient data from exchanges"}
+        
+        avg_price = sum(prices) / len(prices)
+        signals = {"BUY": 0, "SELL": 0}
+        
+        # Arbitrage signals
+        if coinbase.get('price', 0) > avg_price * 1.002:
+            signals["SELL"] += 1
+        elif coinbase.get('price', 0) < avg_price * 0.998:
+            signals["BUY"] += 1
+        
+        if kraken.get('last', 0) > avg_price * 1.002:
+            signals["SELL"] += 1
+        elif kraken.get('last', 0) < avg_price * 0.998:
+            signals["BUY"] += 1
+        
+        if binance_spot.get('price', 0) > avg_price * 1.002:
+            signals["SELL"] += 1
+        elif binance_spot.get('price', 0) < avg_price * 0.998:
+            signals["BUY"] += 1
+        
+        # Funding rate signals dari semua exchange
+        buy_funding = 0
+        sell_funding = 0
+        total_rate = 0
+        count_rate = 0
+        active_exchanges = []
+        
+        for exchange, data in funding_rates.items():
+            if 'error' not in data and data.get('rate', 0) != 0:
+                rate = data.get('rate', 0)
+                total_rate += rate
+                count_rate += 1
+                active_exchanges.append(exchange)
+                if data.get('signal') == 'BUY':
+                    buy_funding += 1
+                    signals["BUY"] += 1
+                elif data.get('signal') == 'SELL':
+                    sell_funding += 1
+                    signals["SELL"] += 1
+        
+        avg_rate = total_rate / count_rate if count_rate > 0 else 0
+        
+        # Logika final dengan lebih banyak exchange
+        total_signals = signals.get("BUY", 0) + signals.get("SELL", 0)
+        
+        if signals.get("BUY", 0) >= 6:
+            return {"signal": "BUY", "confidence": 80, "reason": f"Strong bullish: {buy_funding}/{count_rate} funding bullish (avg rate: {avg_rate:.6f}%)"}
+        elif signals.get("SELL", 0) >= 6:
+            return {"signal": "SELL", "confidence": 80, "reason": f"Strong bearish: {sell_funding}/{count_rate} funding bearish (avg rate: {avg_rate:.6f}%)"}
+        elif signals.get("BUY", 0) >= 4:
+            return {"signal": "BUY", "confidence": 70, "reason": f"Bullish: {buy_funding}/{count_rate} funding bullish (avg rate: {avg_rate:.6f}%)"}
+        elif signals.get("SELL", 0) >= 4:
+            return {"signal": "SELL", "confidence": 70, "reason": f"Bearish: {sell_funding}/{count_rate} funding bearish (avg rate: {avg_rate:.6f}%)"}
+        elif signals.get("BUY", 0) >= 2:
+            return {"signal": "BUY", "confidence": 60, "reason": f"Lean bullish: {buy_funding}/{count_rate} funding bullish (avg rate: {avg_rate:.6f}%)"}
+        elif signals.get("SELL", 0) >= 2:
+            return {"signal": "SELL", "confidence": 60, "reason": f"Lean bearish: {sell_funding}/{count_rate} funding bearish (avg rate: {avg_rate:.6f}%)"}
+        else:
+            return {"signal": "HOLD", "confidence": 50, "reason": f"Neutral: funding rates (avg: {avg_rate:.6f}%) from {count_rate} exchanges"}

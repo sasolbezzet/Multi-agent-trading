@@ -1,0 +1,38 @@
+import requests
+
+class SentimentAgent:
+    def __init__(self):
+        self.name = "Sentiment Analyst"
+    
+    async def analyze(self):
+        try:
+            resp = requests.get("https://api.alternative.me/fng/", timeout=10)
+            fg_data = resp.json()
+            fg_value = int(fg_data['data'][0]['value'])
+            fg_class = fg_data['data'][0]['value_classification']
+            
+            if fg_value < 25:
+                signal = "BUY"
+                confidence = 80
+            elif fg_value < 40:
+                signal = "BUY"
+                confidence = 65
+            elif fg_value > 75:
+                signal = "SELL"
+                confidence = 80
+            elif fg_value > 60:
+                signal = "SELL"
+                confidence = 65
+            else:
+                signal = "HOLD"
+                confidence = 50
+            
+            return {
+                "agent": self.name,
+                "signal": signal,
+                "confidence": confidence,
+                "fear_greed": fg_value,
+                "fear_greed_class": fg_class
+            }
+        except:
+            return {"agent": self.name, "signal": "HOLD", "confidence": 50, "fear_greed": 50}

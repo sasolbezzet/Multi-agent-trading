@@ -1,0 +1,251 @@
+import requests
+from groq import Groq
+import os
+from dotenv import load_dotenv
+import json
+from datetime import datetime
+
+class WhaleAgent:
+    def __init__(self):
+        self.name = "Whale & On-Chain Analyst"
+        # Inisialisasi Groq AI
+        load_dotenv()
+        self.groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        self.groq_model = "llama-3.1-8b-instant"
+        self.base_url = "https://raw.githubusercontent.com/ErcinDedeoglu/crypto-market-data/main/data/daily/"
+        # Arkham API untuk data real-time
+        self.arkham_api_key = "f1ff04d8-f61f-4433-9f89-f54418f92d7f"
+        self.arkham_headers = {"API-Key": self.arkham_api_key}
+        self.arkham_base = "https://api.arkm.com"
+    
+    async def analyze(self):
+        """Analisis whale + on-chain data dari berbagai sumber"""
+        
+        # 1. Arkham API (real-time whale tracking)
+        arkham_data = await self._get_arkham_data()
+        
+        # 2. On-Chain Data (GitHub - gratis)
+        onchain_data = await self._get_onchain_data()
+        # Analisis on-chain dengan Groq AI
+        onchain_ai = await self._analyze_onchain_with_ai(onchain_data)
+        
+        # 3. Gabungkan sinyal
+        hyperliquid_data = await self._get_hyperliquid_orderbook()
+        combined = self._combine_signals(arkham_data, onchain_data, hyperliquid_data)
+        
+        return {
+            "agent": self.name,
+            "signal": combined["signal"],
+            "confidence": combined["confidence"],
+            "reason": combined["reason"],
+            "arkham": arkham_data,
+            "onchain": onchain_data,
+            "onchain_ai": onchain_ai,
+            "hyperliquid": hyperliquid_data,
+            "ai_used": onchain_ai.get("ai_used", "none"),
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    
+
+
+    async def _get_arkham_data(self):
+        """Data dari Arkham API (real-time)"""
+        try:
+            # Transfer besar dari Binance
+            url = f"{self.arkham_base}/transfers"
+            params = {"base": "binance", "usdGte": "10000000", "timeLast": "24h", "limit": 5}
+            resp = requests.get(url, headers=self.arkham_headers, params=params, timeout=15)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                transfers = data.get('transfers', [])
+                total_usd = sum(t.get('historicalUSD', 0) for t in transfers[:5])
+                
+                if total_usd > 500_000_000:
+                    return {"signal": "SELL", "confidence": 70, "reason": f"Large exchange inflow: ${total_usd/1e6:.0f}M"}
+                elif total_usd > 200_000_000:
+                    return {"signal": "HOLD", "confidence": 50, "reason": f"Moderate flow: ${total_usd/1e6:.0f}M"}
+                else:
+                    return {"signal": "BUY", "confidence": 60, "reason": f"Low exchange inflow: ${total_usd/1e6:.0f}M"}
+        except Exception as e:
+            print(f"Arkham error: {e}")
+        
+        return {"signal": "HOLD", "confidence": 50, "reason": "Arkham data unavailable"}
+    
+    async def _get_onchain_data(self):
+        """On-chain data dari GitHub (gratis)"""
+        results = {"buy": 0, "sell": 0, "reasons": []}
+        
+        datasets = [
+            ("btc_exchange_netflow.json", "exchange_netflow"),
+            ("btc_exchange_whale_ratio.json", "whale_ratio"),
+            ("btc_miners_position_index.json", "mpi"),
+            ("btc_long_liquidations.json", "long_liq"),
+            ("btc_coinbase_premium_index.json", "premium"),
+        ]
+        
+        for filename, name in datasets:
+            try:
+                resp = requests.get(self.base_url + filename, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    latest = data.get('data', [])[-1] if data.get('data') else {}
+                    value = latest.get('value', 0)
+                    
+                    if name == "exchange_netflow":
+                        if value < -5000:
+                            results["buy"] += 1
+                            results["reasons"].append(f"Netflow outflow: {value:,.0f} BTC")
+                        elif value > 5000:
+                            results["sell"] += 1
+                            results["reasons"].append(f"Netflow inflow: {value:,.0f} BTC")
+                    
+                    elif name == "whale_ratio":
+                        if value > 0.8:
+                            results["buy"] += 1
+                            results["reasons"].append(f"High whale ratio: {value:.2f}")
+                        elif value < 0.3:
+                            results["sell"] += 1
+                            results["reasons"].append(f"Low whale ratio: {value:.2f}")
+                    
+                    elif name == "mpi":
+                        if value > 2:
+                            results["sell"] += 1
+                            results["reasons"].append(f"High MPI: {value:.2f} (miners selling)")
+                        elif value < 0.5:
+                            results["buy"] += 1
+                            results["reasons"].append(f"Low MPI: {value:.2f} (miners holding)")
+                    
+                    elif name == "long_liq":
+                        if value > 100_000_000:
+                            results["buy"] += 1
+                            results["reasons"].append(f"Large long liquidation: ${value/1e6:.0f}M")
+                    
+                    elif name == "premium":
+                        if value > 0.02:
+                            results["buy"] += 1
+                            results["reasons"].append(f"Positive premium: {value:.4f}")
+                        elif value < -0.02:
+                            results["sell"] += 1
+                            results["reasons"].append(f"Negative premium: {value:.4f}")
+                            
+            except Exception as e:
+                continue
+        
+        return results
+    
+
+    
+    async def _analyze_onchain_with_ai(self, onchain_data):
+        """Analisis data on-chain menggunakan Groq AI"""
+        if not onchain_data or (onchain_data.get('buy', 0) == 0 and onchain_data.get('sell', 0) == 0):
+            return {"signal": "HOLD", "confidence": 50, "reason": "No significant on-chain data"}
+        
+        buy_signals = onchain_data.get('buy', 0)
+        sell_signals = onchain_data.get('sell', 0)
+        reasons = onchain_data.get('reasons', [])
+        
+        prompt = f"""Analyze these on-chain signals for Bitcoin and determine market sentiment.
+
+On-Chain Data:
+- Bullish signals count: {buy_signals}
+- Bearish signals count: {sell_signals}
+- Details: {', '.join(reasons[:5])}
+
+Respond with JSON only:
+{{"signal": "BUY/SELL/HOLD", "confidence": 0-100, "reason": "brief explanation", "score": "bullish/bearish/neutral"}}"""
+        
+        try:
+            response = self.groq_client.chat.completions.create(
+                model=self.groq_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=200
+            )
+            text = response.choices[0].message.content
+            import json, re
+            match = re.search(r'\{[^{}]*\}', text)
+            if match:
+                result = json.loads(match.group())
+                return {
+                    "signal": result.get("signal", "HOLD"),
+                    "confidence": result.get("confidence", 50),
+                    "reason": result.get("reason", "AI analysis completed"),
+                    "score": result.get("score", "neutral"),
+                    "ai_used": "groq-llama-3.1"
+                }
+        except Exception as e:
+            print(f"Groq AI error in on-chain analysis: {e}")
+        
+        # Fallback ke rule-based
+        if buy_signals > sell_signals:
+            return {"signal": "BUY", "confidence": 60, "reason": f"More bullish signals ({buy_signals} vs {sell_signals})", "ai_used": "fallback"}
+        elif sell_signals > buy_signals:
+            return {"signal": "SELL", "confidence": 60, "reason": f"More bearish signals ({sell_signals} vs {buy_signals})", "ai_used": "fallback"}
+        else:
+            return {"signal": "HOLD", "confidence": 50, "reason": "Neutral on-chain signals", "ai_used": "fallback"}
+
+    async def _get_hyperliquid_orderbook(self):
+        """Ambil order book dari Hyperliquid untuk deteksi whale"""
+        try:
+            import requests
+            resp = requests.post(
+                "https://api.hyperliquid.xyz/info",
+                headers={"Content-Type": "application/json"},
+                json={"type": "l2Book", "coin": "BTC"},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                levels = data.get('levels', [])
+                if len(levels) >= 2:
+                    bids = levels[0][:20]
+                    asks = levels[1][:20]
+                    large_bids = [b for b in bids if float(b.get('sz', 0)) > 5]
+                    large_asks = [a for a in asks if float(a.get('sz', 0)) > 5]
+                    
+                    total_bid_size = sum(float(b.get('sz', 0)) for b in bids)
+                    total_ask_size = sum(float(a.get('sz', 0)) for a in asks)
+                    
+                    whale_score = len(large_bids) - len(large_asks)
+                    
+                    if whale_score > 2:
+                        return {"signal": "BUY", "confidence": 65, "reason": f"Large buy orders: {len(large_bids)} bids >5 BTC", "large_bids": len(large_bids), "large_asks": len(large_asks), "total_bid_size": total_bid_size, "total_ask_size": total_ask_size, "status": "OK"}
+                    elif whale_score < -2:
+                        return {"signal": "SELL", "confidence": 65, "reason": f"Large sell orders: {len(large_asks)} asks >5 BTC", "large_bids": len(large_bids), "large_asks": len(large_asks), "total_bid_size": total_bid_size, "total_ask_size": total_ask_size, "status": "OK"}
+                    else:
+                        return {"signal": "HOLD", "confidence": 50, "reason": "No significant whale activity", "large_bids": len(large_bids), "large_asks": len(large_asks), "total_bid_size": total_bid_size, "total_ask_size": total_ask_size, "status": "OK"}
+        except Exception as e:
+            print(f"Hyperliquid error: {e}")
+        return {"signal": "HOLD", "confidence": 50, "reason": "Hyperliquid data unavailable", "status": "ERROR"}
+
+    def _combine_signals(self, arkham, onchain, hyperliquid=None):
+        """Gabungkan sinyal dari Arkham dan on-chain"""
+        buy_score = 0
+        sell_score = 0
+        
+        # Arkham signal
+        if arkham.get('signal') == 'BUY':
+            buy_score += 2
+        elif arkham.get('signal') == 'SELL':
+            sell_score += 2
+        
+        # On-chain signals
+        buy_score += onchain.get('buy', 0)
+        sell_score += onchain.get('sell', 0)
+        
+        reasons = onchain.get('reasons', [])[:3]
+        if arkham.get('reason'):
+            reasons.insert(0, arkham.get('reason'))
+        
+        if buy_score >= 3:
+            return {"signal": "BUY", "confidence": 75, "reason": " | ".join(reasons[:2])}
+        elif sell_score >= 3:
+            return {"signal": "SELL", "confidence": 75, "reason": " | ".join(reasons[:2])}
+        elif buy_score >= 2:
+            return {"signal": "BUY", "confidence": 60, "reason": " | ".join(reasons[:1])}
+        elif sell_score >= 2:
+            return {"signal": "SELL", "confidence": 60, "reason": " | ".join(reasons[:1])}
+        else:
+            return {"signal": "HOLD", "confidence": 50, "reason": "Neutral on-chain signals"}

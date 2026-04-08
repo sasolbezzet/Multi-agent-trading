@@ -1,0 +1,204 @@
+import requests
+import asyncio
+from datetime import datetime
+
+class WhaleAgent:
+    def __init__(self):
+        self.name = "Whale Tracker"
+        self.api_key = "f1ff04d8-f61f-4433-9f89-f54418f92d7f"
+        self.base_url = "https://api.arkm.com"
+        self.headers = {"API-Key": self.api_key}
+    
+    async def analyze(self):
+        """Analisis whale menggunakan semua endpoint Arkham"""
+        
+        # 1. Transfer besar (GET /transfers)
+        large_transfers = await self._get_large_transfers()
+        
+        # 2. Counterparty teratas (GET /counterparties)
+        top_counterparties = await self._get_top_counterparties()
+        
+        # 3. Top flow token (GET /token/top_flow)
+        top_flows = await self._get_top_flows()
+        
+        # 4. Top holders (GET /token/holders)
+        top_holders = await self._get_top_holders()
+        
+        # 5. Swap besar (GET /swaps)
+        large_swaps = await self._get_large_swaps()
+        
+        # Gabungkan semua analisis
+        combined = self._combine_signals(large_transfers, top_counterparties, top_flows, top_holders, large_swaps)
+        
+        return {
+            "agent": self.name,
+            "signal": combined["signal"],
+            "confidence": combined["confidence"],
+            "reason": combined["reason"],
+            "large_transfers": large_transfers[:3] if large_transfers else [],
+            "top_counterparties": top_counterparties[:3] if top_counterparties else [],
+            "top_flows": top_flows[:3] if top_flows else [],
+            "top_holders": top_holders[:3] if top_holders else [],
+            "large_swaps": large_swaps[:3] if large_swaps else [],
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    async def _get_large_transfers(self):
+        """GET /transfers - Transfer besar dari Binance"""
+        try:
+            url = f"{self.base_url}/transfers"
+            params = {
+                "base": "binance",
+                "usdGte": "10000000",  # $10 juta
+                "timeLast": "24h",
+                "limit": 10,
+                "sortKey": "usd",
+                "sortDir": "desc"
+            }
+            resp = requests.get(url, headers=self.headers, params=params, timeout=15)
+            if resp.status_code == 200:
+                return resp.json().get('transfers', [])
+        except Exception as e:
+            print(f"Large transfers error: {e}")
+        return []
+    
+    async def _get_top_counterparties(self):
+        """GET /counterparties/entity/binance - Counterparty teratas Binance"""
+        try:
+            url = f"{self.base_url}/counterparties/entity/binance"
+            params = {
+                "timeLast": "24h",
+                "limit": 10,
+                "usdGte": "1000000"
+            }
+            resp = requests.get(url, headers=self.headers, params=params, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get('counterparties', [])
+        except Exception as e:
+            print(f"Counterparties error: {e}")
+        return []
+    
+    async def _get_top_flows(self):
+        """GET /token/top_flow/bitcoin - Top flow token BTC"""
+        try:
+            url = f"{self.base_url}/token/top_flow/bitcoin"
+            params = {
+                "timeLast": "24h",
+                "limit": 10
+            }
+            resp = requests.get(url, headers=self.headers, params=params, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                # Handle response yang mungkin berupa list atau dict
+                if isinstance(data, list):
+                    return data
+                return data.get('flows', [])
+        except Exception as e:
+            print(f"Top flows error: {e}")
+        return []
+    
+    async def _get_top_holders(self):
+        """GET /token/holders/bitcoin?groupByEntity=true - Top holders BTC"""
+        try:
+            url = f"{self.base_url}/token/holders/bitcoin"
+            params = {
+                "groupByEntity": "true",
+                "limit": 10
+            }
+            resp = requests.get(url, headers=self.headers, params=params, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list):
+                    return data
+                return data.get('entityTopHolders', {}).get('bitcoin', [])
+        except Exception as e:
+            print(f"Top holders error: {e}")
+        return []
+    
+    async def _get_large_swaps(self):
+        """GET /swaps - Swap besar di DEX"""
+        try:
+            url = f"{self.base_url}/swaps"
+            params = {
+                "base": "binance",
+                "usdGte": "1000000",
+                "timeLast": "24h",
+                "limit": 10,
+                "sortKey": "usd",
+                "sortDir": "desc"
+            }
+            resp = requests.get(url, headers=self.headers, params=params, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get('swaps', [])
+        except Exception as e:
+            print(f"Large swaps error: {e}")
+        return []
+    
+    def _combine_signals(self, transfers, counterparts, flows, holders, swaps):
+        """Menggabungkan semua sinyal dari berbagai endpoint"""
+        
+        whale_score = 0
+        reasons = []
+        
+        # Analisis transfer besar
+        if transfers:
+            total_usd = sum(t.get('historicalUSD', 0) for t in transfers[:5])
+            if total_usd > 100_000_000:  # > $100M
+                whale_score += 30
+                reasons.append(f"Large transfers: ${total_usd/1e6:.0f}M")
+            elif total_usd > 50_000_000:
+                whale_score += 15
+                reasons.append(f"Moderate transfers: ${total_usd/1e6:.0f}M")
+        
+        # Analisis top counterparties
+        if counterparts:
+            high_counter = any(c.get('usdVolume', 0) > 50_000_000 for c in counterparts[:3])
+            if high_counter:
+                whale_score += 20
+                reasons.append("High counterparty volume detected")
+        
+        # Analisis top flows
+        if flows:
+            high_flow = any(f.get('value', 0) > 10_000_000 for f in flows[:3])
+            if high_flow:
+                whale_score += 20
+                reasons.append("Large token flows detected")
+        
+        # Analisis top holders (akumulasi)
+        if holders:
+            concentration = sum(h.get('balanceUsd', 0) for h in holders[:3]) / 1e9
+            if concentration > 10:  # Top 3 hold > $10B
+                whale_score -= 15
+                reasons.append(f"High holder concentration (${concentration:.0f}B)")
+        
+        # Analisis swaps besar
+        if swaps:
+            large_swap = any(s.get('historicalUSD', 0) > 5_000_000 for s in swaps[:3])
+            if large_swap:
+                whale_score += 15
+                reasons.append("Large DEX swaps detected")
+        
+        # Tentukan sinyal
+        if whale_score >= 40:
+            signal = "BUY"
+            confidence = 75
+        elif whale_score <= -20:
+            signal = "SELL"
+            confidence = 70
+        elif whale_score >= 20:
+            signal = "BUY"
+            confidence = 60
+        else:
+            signal = "HOLD"
+            confidence = 50
+        
+        reason = " | ".join(reasons) if reasons else "No significant whale activity"
+        
+        return {
+            "signal": signal,
+            "confidence": confidence,
+            "reason": reason,
+            "whale_score": whale_score
+        }

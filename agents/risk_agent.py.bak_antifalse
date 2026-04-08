@@ -1,0 +1,66 @@
+import requests
+import os
+
+class RiskAgent:
+    def __init__(self, stop_loss_pct=0.015, take_profit_pct=0.03):
+        self.name = "Risk Manager"
+        self.default_stop_loss_pct = stop_loss_pct
+        self.take_profit_pct = take_profit_pct
+    
+    async def analyze(self, balance, has_position, current_position=None, atr_percent=None):
+        result = {
+            "agent": self.name,
+            "can_trade": True,
+            "risk_score": 0,
+            "reason": "OK"
+        }
+        
+        # Gunakan ATR untuk dynamic stop loss jika tersedia
+        if atr_percent and atr_percent > 0:
+            # Dynamic SL: 1.5x - 2x ATR (tapi minimal 0.8%, maksimal 3%)
+            dynamic_sl = min(max(atr_percent * 1.5, 0.8), 3.0)
+            result["stop_loss_pct"] = dynamic_sl / 100
+            result["stop_loss_type"] = "dynamic_atr"
+        else:
+            result["stop_loss_pct"] = self.default_stop_loss_pct
+            result["stop_loss_type"] = "fixed"
+        
+        result["take_profit_pct"] = self.take_profit_pct
+        
+        # Minimum margin check
+        min_margin = 2.66  # 1 contract BTC dengan leverage 25x
+        if balance < min_margin:
+            result["can_trade"] = False
+            result["risk_score"] = 100
+            result["reason"] = f"Insufficient balance: ${balance:.2f} < ${min_margin:.2f}"
+        elif balance < min_margin * 3:
+            result["risk_score"] = 60
+            result["reason"] = f"Low balance: ${balance:.2f}"
+        elif balance < min_margin * 5:
+            result["risk_score"] = 30
+            result["reason"] = f"Moderate balance: ${balance:.2f}"
+        else:
+            result["risk_score"] = 10
+            result["reason"] = f"Healthy balance: ${balance:.2f}"
+        
+        if has_position:
+            result["can_trade"] = False
+            result["reason"] = "Position already open"
+        
+        return result
+    
+    def calculate_sl_tp(self, price, action, atr_percent=None):
+        if atr_percent and atr_percent > 0:
+            # Dynamic SL based on ATR
+            sl_pct = min(max(atr_percent * 1.5, 0.8), 3.0) / 100
+        else:
+            sl_pct = self.default_stop_loss_pct
+        
+        if action == "BUY":
+            stop_loss = round(price * (1 - sl_pct), 2)
+            take_profit = round(price * (1 + self.take_profit_pct), 2)
+        else:
+            stop_loss = round(price * (1 + sl_pct), 2)
+            take_profit = round(price * (1 - self.take_profit_pct), 2)
+        
+        return stop_loss, take_profit

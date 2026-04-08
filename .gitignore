@@ -1,0 +1,43 @@
+# Environment
+.env
+venv/
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+bot_restart.log
+monitor.log
+
+# IDE
+.vscode/
+.idea/
+
+# Backup
+*.backup
+*.bak
+*.old
+stable_backup*/
+*.db
+
+# Environment variables (jangan pernah diupload!)
+.env
+.env.*
+*.env
+!.env.example
+
+# Backup files
+*.bak
+*.backup
+*.old
+*.backup_*
+
+# Logs and databases
+*.log
+*.db
+*.sqlite
+
+# Python
+__pycache__/
+*.pyc
+venv/

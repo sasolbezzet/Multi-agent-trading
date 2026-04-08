@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+import os
+import asyncio
+import logging
+import json
+from datetime import datetime
+from dotenv import load_dotenv
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
+from agents.technical_agent import TechnicalAgent
+from agents.sentiment_agent import SentimentAgent
+from agents.news_social_agent import NewsSocialAgent
+from agents.exchange_agent import ExchangeAgent
+from agents.risk_agent import RiskAgent
+from agents.groq_orchestrator import GroqOrchestrator
+from utils.kucoin_api import KuCoinFutures
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class MultiAgentTradingBot:
+    def __init__(self):
+        self.technical = TechnicalAgent()
+        self.sentiment = SentimentAgent()
+        self.news_social = NewsSocialAgent()
+        self.exchange = ExchangeAgent()
+        self.risk = RiskAgent(
+            stop_loss_pct=float(os.getenv('STOP_LOSS_PCT', 0.015)),
+            take_profit_pct=float(os.getenv('TAKE_PROFIT_PCT', 0.03))
+        )
+        
+        self.groq = GroqOrchestrator(os.getenv('GROQ_API_KEY'))
+        self.kucoin = KuCoinFutures(
+            api_key=os.getenv('KUCOIN_API_KEY'),
+            api_secret=os.getenv('KUCOIN_API_SECRET'),
+            api_passphrase=os.getenv('KUCOIN_API_PASSPHRASE')
+        )
+        
+        self.current_signal = None
+        self.last_signal_time = None
+        self.last_action = None
+        self.position_opened_time = None
+        self.symbol = os.getenv('SYMBOL', 'XBTUSDTM')
+        self.analysis_interval = int(os.getenv('ANALYSIS_INTERVAL_MINUTES', 120))
+        
+        self.scheduler = AsyncIOScheduler()
+        self.application = None
+    
+    async def analyze_and_trade(self):
+        logger.info("=" * 50)
+        logger.info("Starting Multi-Agent Analysis (4 Agents: Tech + Sentiment + NewsSocial + Risk)")
+        
+        current_price = self.kucoin.get_price(self.symbol)
+        balance = self.kucoin.get_balance()
+        position = self.kucoin.get_position(self.symbol)
+        has_position = position['has_position']
+        
+        logger.info(f"Price: ${current_price:,.2f} | Balance: ${balance:.2f} | Position: {has_position}")
+        
+        if has_position:
+            sl_triggered, tp_triggered = self._check_sl_tp(position, current_price)
+            if sl_triggered or tp_triggered:
+                result = self.kucoin.close_position(self.symbol)
+                if result:
+                    await self.send_telegram_message(
+                        f"🔴 *POSITION CLOSED*\nReason: {'STOP LOSS' if sl_triggered else 'TAKE PROFIT'}\n"
+                        f"Exit: ${current_price:.2f}\nPnL: {position['pnl']:+.2f} USDT"
+                    )
+                    has_position = False
+                return
+        
+        # RUN ALL 4 AGENTS
+        technical = await self.technical.analyze()
+        sentiment = await self.sentiment.analyze()
+        news_social = await self.news_social.analyze()
+        exchange_data = await self.exchange.analyze()
+        risk = await self.risk.analyze(balance, has_position, position if has_position else None)
+        
+        logger.info(f"Technical: {technical['signal']} ({technical['confidence']}%) - RSI:{technical.get('rsi',50)}")
+        logger.info(f"Sentiment: {sentiment['signal']} ({sentiment['confidence']}%) - F&G:{sentiment.get('fear_greed',50)}")
+        logger.info(f"News/Social: {news_social['signal']} ({news_social['confidence']}%)")
+        logger.info(f"Risk: can_trade={risk['can_trade']}")
+        
+        decision = await self.groq.decide(
+            technical=technical,
+            sentiment=sentiment,
+            news_social=news_social,
+            exchange=exchange_data,
+            risk=risk,
+            current_price=current_price,
+            has_position=has_position,
+            last_action=self.last_action
+        )
+        
+        action = decision.get('action', 'HOLD')
+        confidence = decision.get('confidence', 50)
+        reason = decision.get('reason', 'No reason')
+        
+        logger.info(f"Groq Decision: {action} ({confidence}%) - {reason}")
+        
+        self.current_signal = action
+        self.last_signal_time = datetime.now()
+        
+        await self.execute_trading(action, current_price, has_position, position, confidence, reason, technical, sentiment, news_social, exchange_data)
+    
+    def _check_sl_tp(self, position, current_price):
+        if position['side'] == 'long':
+            sl_price = position['entry'] * (1 - self.risk.stop_loss_pct)
+            tp_price = position['entry'] * (1 + self.risk.take_profit_pct)
+            return current_price <= sl_price, current_price >= tp_price
+        else:
+            sl_price = position['entry'] * (1 + self.risk.stop_loss_pct)
+            tp_price = position['entry'] * (1 - self.risk.take_profit_pct)
+            return current_price >= sl_price, current_price <= tp_price
+    
+    async def execute_trading(self, action, current_price, has_position, position, confidence, reason, technical, sentiment, news_social, exchange):
+        
+        if action == "HOLD":
+            await self.send_telegram_message(
+                f"⚪ *HOLD SIGNAL*\nPrice: ${current_price:.2f}\nConfidence: {confidence}%\nReason: {reason}\n\n"
+                f"📊 Technical: {technical['signal']}\n"
+                f"📰 Sentiment: {sentiment['signal']}\n"
+                f"📱 News/Social: {news_social['signal']}"
+            )
+            return
+        
+        if action == "CLOSE_ONLY" and has_position:
+            result = self.kucoin.close_position(self.symbol)
+            if result:
+                await self.send_telegram_message(f"🔴 *POSITION CLOSED*\nPrice: ${current_price:.2f}\nReason: {reason}")
+                self.last_action = None
+                self.position_opened_time = None
+            return
+        
+        risk_result = await self.risk.analyze(self.kucoin.get_balance(), has_position)
+        if not risk_result['can_trade']:
+            await self.send_telegram_message(f"⚠️ Cannot trade: {risk_result['reason']}")
+            return
+        
+        if has_position:
+            self.kucoin.close_position(self.symbol)
+            await asyncio.sleep(2)
+        
+        size = 1
+        side = "buy" if action == "BUY" else "sell"
+        sl, tp = self.risk.calculate_sl_tp(current_price, action)
+        
+        await self.send_telegram_message(
+            f"🚀 *{action} SIGNAL EXECUTED*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Technical: {technical['signal']} ({technical['confidence']}%)\n"
+            f"📰 Sentiment: {sentiment['signal']} ({sentiment['confidence']}%)\n"
+            f"📱 News/Social: {news_social['signal']} ({news_social['confidence']}%)\n"
+            f"💱 Exchange: {exchange.get('signal', 'HOLD')} ({exchange.get('confidence', 50)}%)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🧠 *Groq Decision*: {action} ({confidence}%)\n"
+            f"📝 Reason: {reason}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Entry: ${current_price:.2f}\n"
+            f"📦 Size: {size} contract\n"
+            f"🛡️ SL: ${sl:.2f}\n"
+            f"🎯 TP: ${tp:.2f}"
+        )
+        
+        order = self.kucoin.place_order(side, size, self.symbol)
+        if order:
+            logger.info(f"Order placed: {action}")
+            self.last_action = action
+            self.position_opened_time = datetime.now()
+        else:
+            logger.error("Order failed!")
+    
+    async def send_telegram_message(self, message):
+        if self.application:
+            chat_id = os.getenv('TELEGRAM_CHAT_ID')
+            if chat_id:
+                await self.application.bot.send_message(chat_id, message, parse_mode='Markdown')
+    
+    def get_status_text(self):
+        balance = self.kucoin.get_balance()
+        position = self.kucoin.get_position(self.symbol)
+        price = self.kucoin.get_price(self.symbol)
+        
+        status = f"🤖 *MULTI-AGENT TRADING BOT (4 AGENTS)*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        status += f"💰 Balance: ${balance:.2f}\n"
+        status += f"📈 BTC Price: ${price:.2f}\n"
+        status += f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        
+        if position['has_position']:
+            status += f"📌 *ACTIVE POSITION*\n   Side: {'🟢 LONG' if position['side'] == 'long' else '🔴 SHORT'}\n"
+            status += f"   Entry: ${position['entry']:.2f}\n   Current: ${position['current']:.2f}\n"
+            status += f"   PnL: {position['pnl']:+.2f} USDT\n"
+        else:
+            status += f"📌 Position: NONE\n"
+        
+        status += f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        if self.current_signal:
+            status += f"📡 Last Signal: {self.current_signal}\n"
+        status += f"\n🔄 Next analysis: {self.analysis_interval} minutes"
+        return status
+
+trading_bot = MultiAgentTradingBot()
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("📊 STATUS", callback_data="status")],
+        [InlineKeyboardButton("📡 FORCE SIGNAL", callback_data="force_signal")],
+        [InlineKeyboardButton("🔴 CLOSE POSITION", callback_data="close")],
+        [InlineKeyboardButton("🔄 REFRESH", callback_data="refresh")]
+    ]
+    await update.message.reply_text(
+        "🤖 *AI Multi-Agent Trading Bot*\n\n"
+        "Bot ini menggunakan **4 AI Agent** + **Groq Orchestrator**:\n"
+        "• Technical Analyst (RSI, MACD, Trend)\n"
+        "• Sentiment Analyst (Fear & Greed)\n"
+        "• News/Social Analyst (Berita & Media Sosial)\n"
+        "• Risk Manager (SL/TP, Balance)\n"
+        "• Groq AI (Final Decision)\n\n"
+        "Signal auto-execute ke KuCoin Futures!\n"
+        "Interval analisis: 2 jam",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = update.effective_chat.id
+    
+    if data == "status":
+        await context.bot.send_message(chat_id, trading_bot.get_status_text(), parse_mode='Markdown')
+    elif data == "force_signal":
+        await context.bot.send_message(chat_id, "🔄 Force analyzing...", parse_mode='Markdown')
+        try:
+            await trading_bot.analyze_and_trade()
+        except Exception as e:
+            await context.bot.send_message(chat_id, f"❌ Error: {str(e)[:100]}", parse_mode='Markdown')
+    elif data == "close":
+        pos = trading_bot.kucoin.get_position(trading_bot.symbol)
+        if pos['has_position']:
+            result = trading_bot.kucoin.close_position(trading_bot.symbol)
+            if result:
+                await context.bot.send_message(chat_id, f"🔴 Closed at ${pos['current']:.2f}\nPnL: {pos['pnl']:+.2f}")
+            else:
+                await context.bot.send_message(chat_id, "❌ Failed")
+        else:
+            await context.bot.send_message(chat_id, "No position")
+    elif data == "refresh":
+        await context.bot.send_message(chat_id, trading_bot.get_status_text(), parse_mode='Markdown')
+
+async def scheduled_analysis():
+    await trading_bot.analyze_and_trade()
+
+async def main():
+    trading_bot.scheduler.add_job(scheduled_analysis, 'interval', minutes=trading_bot.analysis_interval)
+    trading_bot.scheduler.start()
+    
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN not found!")
+        return
+    
+    application = Application.builder().token(token).build()
+    trading_bot.application = application
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    
+    await application.bot.delete_webhook(drop_pending_updates=True)
+    
+    logger.info("Starting Telegram bot with 4 agents...")
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    
+    # Save chat_id
+    logger.info("Bot is running. Send /start on Telegram to interact.")
+    
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main())

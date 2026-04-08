@@ -1,0 +1,173 @@
+import requests
+from datetime import datetime
+
+class ExchangeAgent:
+    def __init__(self):
+        self.name = "Exchange Analyst"
+    
+    async def analyze(self):
+        coinbase = await self._get_coinbase()
+        kraken = await self._get_kraken()
+        binance_spot = await self._get_binance_spot()
+        funding_rates = await self._get_all_funding_rates()
+        result = self._analyze_flow(coinbase, kraken, binance_spot, funding_rates)
+        return {
+            "agent": self.name,
+            "signal": result["signal"],
+            "confidence": result["confidence"],
+            "coinbase": coinbase,
+            "kraken": kraken,
+            "binance_spot": binance_spot,
+            "funding_rates": funding_rates,
+            "reason": result["reason"],
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    async def _get_coinbase(self):
+        try:
+            resp = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=5)
+            if resp.status_code == 200:
+                return {"price": float(resp.json()['data']['amount']), "status": "OK"}
+        except:
+            pass
+        return {"price": 0, "status": "ERROR"}
+    
+    async def _get_kraken(self):
+        try:
+            resp = requests.get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()['result']['XXBTZUSD']
+                return {"bid": float(data['b'][0]), "ask": float(data['a'][0]), "last": float(data['c'][0]), "status": "OK"}
+        except:
+            pass
+        return {"last": 0, "status": "ERROR"}
+    
+    async def _get_binance_spot(self):
+        try:
+            resp = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=5)
+            if resp.status_code == 200:
+                return {"price": float(resp.json()['price']), "status": "OK"}
+        except:
+            pass
+        return {"status": "ERROR"}
+    
+    async def _get_all_funding_rates(self):
+        results = {}
+        
+        # Binance
+        try:
+            r = requests.get("https://dapi.binance.com/dapi/v1/fundingRate?symbol=BTCUSD_PERP&limit=1", timeout=10)
+            if r.status_code == 200 and r.json():
+                rate = float(r.json()[0]['fundingRate'])
+                results['binance'] = {"rate": rate, "signal": "SELL" if rate > 0.01 else "BUY" if rate < -0.005 else "HOLD"}
+        except: pass
+        
+        # Bybit
+        try:
+            r = requests.get("https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT", timeout=10)
+            if r.status_code == 200 and r.json().get('retCode') == 0:
+                rate = float(r.json()['result']['list'][0]['fundingRate'])
+                results['bybit'] = {"rate": rate, "signal": "SELL" if rate > 0.01 else "BUY" if rate < -0.005 else "HOLD"}
+        except: pass
+        
+        # OKX
+        try:
+            r = requests.get("https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USD-SWAP", timeout=10)
+            if r.status_code == 200 and r.json().get('code') == '0' and r.json().get('data'):
+                rate = float(r.json()['data'][0]['fundingRate'])
+                results['okx'] = {"rate": rate, "signal": "SELL" if rate > 0.01 else "BUY" if rate < -0.005 else "HOLD"}
+        except: pass
+        
+        # KuCoin (endpoint bermasalah, disable sementara)
+        results['kucoin'] = {"rate": 0, "signal": "HOLD", "info": "KuCoin funding rate endpoint unavailable (404)"}
+        
+        # Kraken
+        try:
+            r = requests.get("https://futures.kraken.com/derivatives/api/v3/tickers", timeout=10)
+            if r.status_code == 200:
+                for t in r.json().get('tickers', []):
+                    if t.get('symbol') == 'PI_XBTUSD':
+                        rate = float(t.get('fundingRate', 0))
+                        results['kraken'] = {"rate": rate, "signal": "SELL" if rate > 0.01 else "BUY" if rate < -0.005 else "HOLD"}
+                        break
+        except: pass
+        
+        # BitMEX
+        try:
+            r = requests.get("https://www.bitmex.com/api/v1/instrument?symbol=XBTUSD", timeout=10)
+            if r.status_code == 200 and r.json():
+                rate = float(r.json()[0].get('fundingRate', 0))
+                results['bitmex'] = {"rate": rate, "signal": "SELL" if rate > 0.01 else "BUY" if rate < -0.005 else "HOLD"}
+        except: pass
+        
+        # Gate.io
+        try:
+            r = requests.get("https://api.gateio.ws/api/v4/futures/usdt/contracts/BTC_USDT", timeout=10)
+            if r.status_code == 200:
+                rate = float(r.json().get('funding_rate', 0))
+                results['gateio'] = {"rate": rate, "signal": "SELL" if rate > 0.01 else "BUY" if rate < -0.005 else "HOLD"}
+        except: pass
+        
+        # MEXC
+        try:
+            r = requests.get("https://api.mexc.com/api/v3/funding-rate?symbol=BTCUSDT", timeout=10)
+            if r.status_code == 200:
+                rate = float(r.json().get('fundingRate', 0))
+                results['mexc'] = {"rate": rate, "signal": "SELL" if rate > 0.01 else "BUY" if rate < -0.005 else "HOLD"}
+        except: pass
+        
+        # Phemex
+        try:
+            r = requests.get("https://api.phemex.com/md/funding_rates?symbol=BTCUSD", timeout=10)
+            if r.status_code == 200 and r.json().get('code') == 0 and r.json().get('data', {}).get('rows'):
+                rate = float(r.json()['data']['rows'][0]['fundingRate'])
+                results['phemex'] = {"rate": rate, "signal": "SELL" if rate > 0.01 else "BUY" if rate < -0.005 else "HOLD"}
+        except: pass
+        
+        return results
+    
+    def _analyze_flow(self, coinbase, kraken, binance_spot, funding_rates):
+        prices = []
+        if coinbase.get('price', 0) > 0: prices.append(coinbase['price'])
+        if kraken.get('last', 0) > 0: prices.append(kraken['last'])
+        if binance_spot.get('price', 0) > 0: prices.append(binance_spot['price'])
+        if len(prices) < 2:
+            return {"signal": "HOLD", "confidence": 50, "reason": "Insufficient data"}
+        
+        avg_price = sum(prices) / len(prices)
+        signals = {"BUY": 0, "SELL": 0}
+        
+        # Arbitrage
+        if coinbase.get('price', 0) > avg_price * 1.002: signals["SELL"] += 1
+        elif coinbase.get('price', 0) < avg_price * 0.998: signals["BUY"] += 1
+        if kraken.get('last', 0) > avg_price * 1.002: signals["SELL"] += 1
+        elif kraken.get('last', 0) < avg_price * 0.998: signals["BUY"] += 1
+        if binance_spot.get('price', 0) > avg_price * 1.002: signals["SELL"] += 1
+        elif binance_spot.get('price', 0) < avg_price * 0.998: signals["BUY"] += 1
+        
+        # Funding rate
+        buy_funding = sell_funding = total_rate = count_rate = 0
+        for ex, data in funding_rates.items():
+            if 'error' not in data and 'info' not in data and data.get('rate', 0) != 0:
+                total_rate += data['rate']
+                count_rate += 1
+                if data['signal'] == 'BUY':
+                    buy_funding += 1
+                    signals["BUY"] += 1
+                elif data['signal'] == 'SELL':
+                    sell_funding += 1
+                    signals["SELL"] += 1
+        
+        avg_rate = total_rate / count_rate if count_rate else 0
+        total_buy = signals.get("BUY", 0)
+        total_sell = signals.get("SELL", 0)
+        
+        if total_buy >= 5:
+            return {"signal": "BUY", "confidence": 75, "reason": f"Strong bullish: {buy_funding}/{count_rate} funding bullish (avg rate: {avg_rate:.6f}%)"}
+        if total_sell >= 5:
+            return {"signal": "SELL", "confidence": 75, "reason": f"Strong bearish: {sell_funding}/{count_rate} funding bearish (avg rate: {avg_rate:.6f}%)"}
+        if total_buy >= 3:
+            return {"signal": "BUY", "confidence": 65, "reason": f"Bullish: {buy_funding}/{count_rate} funding bullish (avg rate: {avg_rate:.6f}%)"}
+        if total_sell >= 3:
+            return {"signal": "SELL", "confidence": 65, "reason": f"Bearish: {sell_funding}/{count_rate} funding bearish (avg rate: {avg_rate:.6f}%)"}
+        return {"signal": "HOLD", "confidence": 50, "reason": f"Neutral: funding avg {avg_rate:.6f}% from {count_rate} exchanges"}
