@@ -1,0 +1,36 @@
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Database
+*.db
+*.db-journal
+
+# Logs
+logs/
+*.log
+*.out
+*.err
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Backup files
+*.backup*
+*.bak*
+stable_backup_v*/
+main.py.backup_*
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local config
+.auto_trade_status.json

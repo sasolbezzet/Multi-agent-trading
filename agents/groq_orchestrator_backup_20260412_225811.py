@@ -1,0 +1,247 @@
+import json
+import re
+import os
+from dotenv import load_dotenv
+from groq import Groq
+from openai import OpenAI
+from backtest_metrics import BacktestMetrics
+
+load_dotenv("/home/ubuntu/groq_trading_bot/.env")
+
+class GroqOrchestrator:
+    async def _get_guavy_scorecard(self):
+        try:
+            import requests
+            api_key = os.getenv('GUAVY_API_KEY')
+            if not api_key:
+                return None
+            url = "https://data.guavy.com/api/v1/instruments/scorecard/BTC"
+            headers = {"Authorization": f"Bearer {api_key}"}
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                return {
+                    "action": data.get('action'),
+                    "score": data.get('score'),
+                    "profit_percentage": data.get('percentage_profit'),
+                    "in_trade": data.get('in_trade'),
+                    "strategy": data.get('strategy'),
+                    "source": "Guavy"
+                }
+        except Exception as e:
+            print(f"Guavy scorecard error: {e}")
+        return None
+
+    async def _get_momentum_quality(self):
+        """Get multi-timeframe momentum quality for entry"""
+        try:
+            import yfinance as yf
+            from datetime import datetime, timedelta
+            
+            timeframes = [
+                ('5m', '5m'), ('15m', '15m'), ('30m', '30m'),
+                ('1h', '60m'), ('4h', '1h'), ('1d', '1d')
+            ]
+            results = []
+            
+            for tf_name, interval in timeframes:
+                try:
+                    start = datetime.now() - timedelta(days=7 if interval in ['5m','15m','30m','60m','1h'] else 30)
+                    ticker = yf.Ticker("BTC-USD")
+                    df = ticker.history(start=start, interval=interval)
+                    
+                    if not df.empty and len(df) >= 10:
+                        closes = df['Close'].tail(30)
+                        if len(closes) >= 5:
+                            current = closes.iloc[-1]
+                            prev = closes.iloc[-5]
+                            momentum = (current - prev) / prev * 100
+                            results.append(momentum)
+                except Exception as e:
+                    print(f"Momentum error {tf_name}: {e}")
+            
+            if results:
+                bullish = sum(1 for m in results if m > 0)
+                bearish = sum(1 for m in results if m < 0)
+                total = len(results)
+                buy_quality = int(bullish / total * 100)
+                sell_quality = int(bearish / total * 100)
+                direction = "BULLISH" if buy_quality >= 60 else "BEARISH" if sell_quality >= 60 else "NEUTRAL"
+                
+                return {
+                    'buy_quality': buy_quality,
+                    'sell_quality': sell_quality,
+                    'direction': direction,
+                    'bullish': bullish,
+                    'bearish': bearish,
+                    'total': total
+                }
+        except Exception as e:
+            print(f"Momentum error: {e}")
+        
+        return {'buy_quality': 50, 'sell_quality': 50, 'direction': 'NEUTRAL', 'bullish': 0, 'bearish': 0, 'total': 0}
+
+    def __init__(self):
+        self.groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
+        self.groq_model = "llama-3.1-8b-instant"
+        self.openrouter_key = os.getenv('OPENROUTER_API_KEY')
+        if self.openrouter_key:
+            self.openrouter_client = OpenAI(
+                api_key=self.openrouter_key,
+                base_url="https://openrouter.ai/api/v1"
+            )
+            self.openrouter_model = "nvidia/nemotron-3-super-120b-a12b:free"
+            self.use_openrouter = True
+        else:
+            self.use_openrouter = False
+        self.backtest_metrics = BacktestMetrics()
+
+    async def decide(self, technical, sentiment, news_social, exchange, whale, risk, current_price, has_position, last_action=None):
+        # Early validation
+        if not risk.get('can_trade', True):
+            return {"action": "HOLD", "confidence": 50, "reason": "Risk agent blocks trading", "ai_used": "rule-based"}
+        if has_position:
+            return {"action": "HOLD", "confidence": 50, "reason": "Position already open", "ai_used": "rule-based"}
+        
+        # Get momentum data
+        momentum = await self._get_momentum_quality()
+        
+        # Get backtesting metrics
+        try:
+            metrics = self.backtest_metrics.get_recent_performance(7)
+            accuracy = self.backtest_metrics.get_signal_accuracy()
+        except:
+            metrics = None
+            accuracy = None
+        
+        backtest_info = ""
+        if metrics:
+            backtest_info = f"""
+=== BACKTESTING METRICS (Last 7 days) ===
+Total Return: {metrics['total_return']:+.2f}%
+Win Rate: {metrics['win_rate']}%
+Total Trades: {metrics['total_trades']}
+Profitability: {'PROFITABLE' if metrics['is_profitable'] else 'NOT PROFITABLE'}
+"""
+        if accuracy:
+            backtest_info += f"""
+=== HISTORICAL ACCURACY ===
+Avg Return: {accuracy['avg_return']:+.2f}%
+Avg Win Rate: {accuracy['avg_win_rate']}%
+Trend: {accuracy['trend']}
+"""
+        
+        prompt = f"""IMPORTANT RULES:
+
+🔴 WEIGHTED VOTING (bobot berbeda):
+
+   - Whale Agent: bobot 3 (PALING PENTING)
+
+   - News Agent: bobot 2
+
+   - Technical Agent: bobot 2
+
+   - Sentiment Agent: bobot 1
+
+   - Exchange Agent: bobot 1
+
+   - Risk Agent: hanya untuk validasi
+
+
+
+🔴 WHALE PRIORITY:
+
+   - Inflow > $500M = HARUS SELL (abaikan signal lain)
+
+   - Inflow < $100M = HARUS BUY (abaikan signal lain)
+
+
+    MAJORITY RULES: Count BUY/SELL from 6 agents. If ≥4 SELL → output SELL. If ≥4 BUY → output BUY. Risk agent does NOT block reverse trade.
+1. Count BUY vs SELL signals from the 6 agents (Technical, Sentiment, News, Exchange, Whale, Risk).
+2. If 4 or more agents signal SELL → you MUST output SELL.
+3. If 4 or more agents signal BUY → you MUST output BUY.
+4. If you have an existing position and majority signals opposite direction → REVERSE TRADE.
+5. Risk agent only blocks NEW positions, NOT reverse trade.
+
+You are a crypto trading AI. Based on 6 agents and BACKTESTING RESULTS below, decide BUY/SELL/HOLD.
+
+BTC Price: ${current_price}
+{backtest_info}
+
+=== MOMENTUM MULTI-TIMEFRAME ===
+Buy Quality: {momentum.get('buy_quality', 50)}%
+Sell Quality: {momentum.get('sell_quality', 50)}%
+Direction: {momentum.get('direction', 'NEUTRAL')}
+Bullish Timeframes: {momentum.get('bullish', 0)}/{momentum.get('total', 0)}
+
+=== TECHNICAL AGENT ===
+Signal: {technical.get('signal')} ({technical.get('confidence')}%)
+RSI: {technical.get('rsi', 50)} | Trend: {technical.get('trend', 'neutral')}
+
+=== SENTIMENT AGENT ===
+Signal: {sentiment.get('signal')} ({sentiment.get('confidence')}%)
+Fear & Greed: {sentiment.get('fear_greed', 50)}
+
+=== NEWS & SOCIAL AGENT ===
+Signal: {news_social.get('signal')} ({news_social.get('confidence')}%)
+
+=== EXCHANGE AGENT ===
+Volume 24h: {exchange.get("volume_24h", 0):,.0f}
+Open Interest: {exchange.get("open_interest", 0):,.0f}
+Volume Surge: {exchange.get("volume_surge", "N/A")}
+OI Trend: {exchange.get("oi_trend", "N/A")}
+Signal: {exchange.get('signal')} ({exchange.get('confidence')}%)
+
+=== WHALE AGENT ===
+Signal: {whale.get('signal')} ({whale.get('confidence')}%)
+Reason: {whale.get('reason', '')[:100]}
+
+=== RISK AGENT ===
+Can Trade: {risk.get('can_trade', True)}
+Risk Score: {risk.get('risk_score', 0)}/100
+Min Confidence Required: {risk.get('min_confidence_required', 60)}%
+
+=== STATUS ===
+Has Position: {has_position}
+Last Action: {last_action if last_action else 'None'}
+
+Respond with JSON only:
+{{"action": "BUY/SELL/HOLD", "confidence": 0-100, "reason": "brief explanation"}}"""
+
+        # Try OpenRouter first
+        if self.use_openrouter:
+            try:
+                response = self.openrouter_client.chat.completions.create(
+                    model=self.openrouter_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                    max_tokens=250,
+                    extra_headers={"HTTP-Referer": "http://localhost", "X-Title": "Trading Bot"}
+                )
+                text = response.choices[0].message.content
+                match = re.search(r'\{[^{}]*\}', text)
+                if match:
+                    result = json.loads(match.group())
+                    result['ai_used'] = 'nemotron-3-super'
+                    return result
+            except Exception as e:
+                print(f"OpenRouter error: {e}")
+
+        # Fallback to Groq
+        try:
+            response = self.groq_client.chat.completions.create(
+                model=self.groq_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=250
+            )
+            text = response.choices[0].message.content
+            match = re.search(r'\{[^{}]*\}', text)
+            if match:
+                result = json.loads(match.group())
+                result['ai_used'] = 'groq-llama-3.1'
+                return result
+        except Exception as e:
+            print(f"Groq error: {e}")
+
+        return {"action": "HOLD", "confidence": 50, "reason": "Fallback", "ai_used": "fallback"}

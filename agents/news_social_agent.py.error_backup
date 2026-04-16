@@ -1,0 +1,230 @@
+import requests
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from groq import Groq
+import os
+import asyncio
+import time
+import json
+import re
+
+class NewsSocialAgent:
+    def __init__(self):
+        self.name = "News & Social Analyst (AI)"
+        # Load API key manually
+        env_file = '/home/ubuntu/groq_trading_bot/.env'
+        with open(env_file) as f:
+            for line in f:
+                if line.strip() and not line.startswith('#'):
+                    key, value = line.strip().split('=', 1)
+                    os.environ[key] = value
+        self.groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
+        self.groq_model = "llama-3.1-8b-instant"
+        
+        self._geo_cache = None
+        self._geo_cache_time = 0
+        
+        self.rss_sources = [
+            ("CoinTelegraph", "https://cointelegraph.com/rss"),
+            ("Bitcoin.com", "https://news.bitcoin.com/feed/"),
+            ("ZyCrypto", "https://zycrypto.com/feed/"),
+            ("CryptoPotato", "https://cryptopotato.com/feed/"),
+            ("NewsBTC", "https://www.newsbtc.com/feed/"),
+            ("Bitcoinist", "https://bitcoinist.com/feed/"),
+            ("CryptoNews", "https://cryptonews.com/feed/"),
+            ("Decrypt", "https://decrypt.co/feed"),
+        ]
+    
+
+    async def _get_newsapi_news(self):
+        """Ambil berita dari NewsAPI.org"""
+        import os
+        api_key = os.getenv('NEWSAPI_KEY')
+        if not api_key:
+            return []
+        
+        try:
+            url = "https://newsapi.org/v2/everything"
+            params = {
+                "q": "cryptocurrency OR bitcoin OR ethereum",
+                "apiKey": api_key,
+                "pageSize": 10,
+                "language": "en",
+                "sortBy": "publishedAt"
+            }
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                articles = data.get('articles', [])
+                return [art.get('title', '') for art in articles if art.get('title')]
+        except Exception as e:
+            print(f"NewsAPI error: {e}")
+        return []
+    
+    async def _get_gnews_news(self):
+        """Ambil berita dari GNews.io"""
+        import os
+        api_key = os.getenv('GNEWS_KEY')
+        if not api_key:
+            return []
+        
+        try:
+            url = "https://gnews.io/api/v4/search"
+            params = {
+                "q": "cryptocurrency bitcoin",
+                "apikey": api_key,
+                "max": 10,
+                "lang": "en",
+                "sortby": "publishedAt"
+            }
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                articles = data.get('articles', [])
+                return [art.get('title', '') for art in articles if art.get('title')]
+        except Exception as e:
+            print(f"GNews error: {e}")
+        return []
+
+    async def _get_rss_headlines(self):
+        all_headlines = []
+        
+        # 1. RSS Feeds
+        for name, url in self.rss_sources:
+            try:
+                resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                if resp.status_code == 200:
+                    try:
+                        root = ET.fromstring(resp.content)
+                        for item in root.findall('.//item')[:3]:
+                            title = item.find('title')
+                            if title is not None and title.text:
+                                all_headlines.append(f"[RSS] {title.text}")
+                    except:
+                        continue
+            except:
+                continue
+        
+        # 2. NewsAPI
+        newsapi_headlines = await self._get_newsapi_news()
+        for h in newsapi_headlines:
+            if h:
+                all_headlines.append(f"[NewsAPI] {h}")
+        
+        # 3. GNews
+        gnews_headlines = await self._get_gnews_news()
+        for h in gnews_headlines:
+            if h:
+                all_headlines.append(f"[GNews] {h}")
+        
+        return all_headlines
+    
+    async def _analyze_with_groq(self, headlines):
+        """Analisis sentimen berita menggunakan Groq AI"""
+        if not headlines:
+            return {"signal": "HOLD", "confidence": 50, "reason": "No news available", "score": 0}
+        
+        news_text = "\n".join([f"{i+1}. {h}" for i, h in enumerate(headlines[:30])])
+        
+        prompt = f"""Analyze each crypto news headline and provide sentiment. Return JSON array.
+
+HEADLINES:
+{news_text}
+
+REQUIRED JSON FORMAT (array of objects):
+[
+  {{"signal": "BUY/SELL/HOLD", "confidence": 0-100, "sentiment_score": -1 to 1, "key_themes": ["theme"], "reason": "analysis"}},
+  ...
+]"""
+
+        try:
+            response = self.groq_client.chat.completions.create(
+                model=self.groq_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=1000
+            )
+            text = response.choices[0].message.content
+            import re, json
+            
+            # Cari array JSON
+            match = re.search(r'\[\s*\{.*\}\s*\]', text, re.DOTALL)
+            if match:
+                results = json.loads(match.group())
+                if isinstance(results, list) and len(results) > 0:
+                    # Hitung agregat dari semua analisis
+                    buy_count = sum(1 for r in results if r.get('signal') == 'BUY')
+                    sell_count = sum(1 for r in results if r.get('signal') == 'SELL')
+                    avg_confidence = sum(r.get('confidence', 50) for r in results) / len(results)
+                    avg_score = sum(r.get('sentiment_score', 0) for r in results) / len(results)
+                    
+                    # Kumpulkan semua themes
+                    all_themes = []
+                    for r in results:
+                        themes = r.get('key_themes', [])
+                        if isinstance(themes, list):
+                            all_themes.extend(themes)
+                    unique_themes = list(dict.fromkeys(all_themes))[:5]
+                    
+                    if buy_count > sell_count:
+                        signal = "BUY"
+                    elif sell_count > buy_count:
+                        signal = "SELL"
+                    else:
+                        signal = "HOLD"
+                    
+                    confidence = min(100, int(avg_confidence))
+                    
+                    return {
+                        "signal": signal,
+                        "confidence": confidence,
+                        "score": round(avg_score, 2),
+                        "key_themes": unique_themes,
+                        "reason": f"Analysis of {len(results)} news items: {buy_count} bullish, {sell_count} bearish. Key themes: {', '.join(unique_themes[:3])}",
+                        "ai_used": "groq-llama-3.1"
+                    }
+        except Exception as e:
+            print(f"Groq AI error: {e}")
+        
+        return {"signal": "HOLD", "confidence": 50, "score": 0, "reason": "AI analysis failed", "ai_used": "fallback"} time.time()
+        if self._geo_cache is not None and (current_time - self._geo_cache_time) < 3600:
+            return self._geo_cache
+        
+        try:
+            from gdeltdoc import GdeltDoc, Filters
+            def fetch():
+                gd = GdeltDoc()
+                f = Filters(keyword="geopolitical OR war OR conflict", timespan="6h", num_records=30)
+                return gd.article_search(f)
+            articles = await asyncio.to_thread(fetch)
+            result = {"signal": "HOLD", "confidence": 50, "risk_score": 0, "reason": "No geopolitical news"}
+            self._geo_cache = result
+            self._geo_cache_time = time.time()
+            return result
+        except:
+            return {"signal": "HOLD", "confidence": 50, "risk_score": 0, "reason": "Unavailable"}
+    
+    async def analyze(self):
+        headlines = await self._get_rss_headlines()
+        ai_result = await self._analyze_with_groq(headlines)
+        geo_risk = await self._get_geopolitical_risk()
+        
+        if geo_risk.get('signal') == 'SELL' and geo_risk.get('risk_score', 0) > 50:
+            final_signal = 'SELL'
+            final_confidence = max(ai_result.get('confidence', 50), geo_risk.get('confidence', 50))
+            reason = f"Geopolitical override: {geo_risk.get('reason')}"
+        else:
+            final_signal = ai_result.get('signal', 'HOLD')
+            final_confidence = ai_result.get('confidence', 50)
+            reason = f"AI Sentiment: {ai_result.get('reason', 'N/A')}"
+        
+        return {
+            "agent": self.name,
+            "signal": final_signal,
+            "confidence": final_confidence,
+            "ai_analysis": ai_result,
+            "geopolitical": geo_risk,
+            "articles_count": len(headlines),
+            "reason": reason,
+            "timestamp": datetime.now().isoformat()
+        }
